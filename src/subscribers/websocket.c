@@ -11,6 +11,9 @@
 #include <zlib.h>
 #endif
 
+#if NCHAN_WEBSOCKET_ALLOW_HIXIE
+#include <ngx_md5.h>
+#endif
 
 //#define DEBUG_LEVEL NGX_LOG_WARN
 #define DEBUG_LEVEL NGX_LOG_DEBUG
@@ -57,6 +60,9 @@
 #define WEBSOCKET_READ_GET_REAL_SIZE_STEP   1
 #define WEBSOCKET_READ_GET_MASK_KEY_STEP    2
 #define WEBSOCKET_READ_GET_PAYLOAD_STEP     3
+
+#define WEBSOCKET_HIXIE_READ_KEY3_STEP      100
+#define WEBSOCKET_HIXIE_READ_PAYLOAD_STEP   101
 
 
 #define WEBSOCKET_FRAME_HEADER_MAX_LENGTH   146 //144 + 2 for possible close status code
@@ -193,6 +199,13 @@ struct full_subscriber_s {
   ngx_event_t             timeout_ev;
   ngx_event_t             closing_ev;
   ws_frame_t              frame;
+  
+#if NCHAN_WEBSOCKET_ALLOW_HIXIE
+  ngx_str_t              *ws_key1;
+  ngx_str_t              *ws_key2;
+  u_char                  ws_key3[8];
+  ngx_buf_t               ws_key3_buf;
+#endif /* NCHAN_WEBSOCKET_ALLOW_HIXIE */
   
   ngx_str_t              *publish_channel_id;
   nchan_pub_upstream_stuff_t *publish_upstream;
@@ -767,6 +780,7 @@ static void closing_ev_handler(ngx_event_t *ev) {
   websocket_finalize_request(fsub);
 }
 
+static void set_buffer(ngx_buf_t *buf, u_char *start, u_char *last, ssize_t len);
 subscriber_t *websocket_subscriber_create(ngx_http_request_t *r, nchan_msg_id_t *msg_id) {
   nchan_request_ctx_t  *ctx = ngx_http_get_module_ctx(r, ngx_nchan_module);
   char                 *err;
@@ -791,6 +805,7 @@ subscriber_t *websocket_subscriber_create(ngx_http_request_t *r, nchan_msg_id_t 
   fsub->already_sent_unsub_request = 0;
   fsub->tmp_pool = NULL;
   fsub->tmp_pool_use_count = 0;
+  
   ngx_memzero(&fsub->ping_ev, sizeof(fsub->ping_ev));
   
   nchan_subscriber_init_timeout_timer(&fsub->sub, &fsub->timeout_ev);
@@ -801,6 +816,9 @@ subscriber_t *websocket_subscriber_create(ngx_http_request_t *r, nchan_msg_id_t 
   fsub->dequeue_handler_data = NULL;
   fsub->awaiting_destruction = 0;
   
+#if NCHAN_WEBSOCKET_ALLOW_HIXIE
+  set_buffer(&fsub->ws_key3_buf, fsub->ws_key3, NULL, sizeof(fsub->ws_key3));
+#endif
   ngx_memzero(&fsub->closing_ev, sizeof(fsub->closing_ev));
   nchan_init_timer(&fsub->closing_ev, closing_ev_handler, fsub);
   
@@ -941,6 +959,10 @@ static ngx_int_t extract_deflate_window_bits(full_subscriber_t *fsub, u_char *lc
   return bits == -1 ? NGX_DECLINED : NGX_OK;
 }
   
+#if NCHAN_WEBSOCKET_ALLOW_HIXIE
+static ngx_int_t websocket_perform_handshake_hixie(full_subscriber_t *fsub);
+#endif /* NCHAN_WEBSOCKET_ALLOW_HIXIE */
+  
 static ngx_int_t websocket_perform_handshake(full_subscriber_t *fsub) {
   static ngx_str_t    magic = ngx_string("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
   ngx_str_t           ws_accept_key, sha1_str;
@@ -966,6 +988,11 @@ static ngx_int_t websocket_perform_handshake(full_subscriber_t *fsub) {
   r->header_only = 1;  
   
   if((tmp = nchan_get_header_value(r, NCHAN_HEADER_SEC_WEBSOCKET_VERSION)) == NULL) {
+#if NCHAN_WEBSOCKET_ALLOW_HIXIE
+    ngx_int_t status = websocket_perform_handshake_hixie(fsub);
+    if (status != NGX_ERROR)
+      return status;
+#endif /* NCHAN_WEBSOCKET_ALLOW_HIXIE */
     fsub->sub.dequeue_after_response=1;
     nchan_respond_cstring(r, NGX_HTTP_BAD_REQUEST, &NCHAN_CONTENT_TYPE_TEXT_PLAIN, "No Sec-Websocket-Version header present", 1);
     return NGX_ERROR;
@@ -1163,7 +1190,8 @@ static void ensure_request_hold(full_subscriber_t *fsub) {
 static ngx_int_t ensure_handshake(full_subscriber_t *fsub) {
   if(fsub->shook_hands == 0) {
     ensure_request_hold(fsub);
-    if(websocket_perform_handshake(fsub) == NGX_OK) {
+    ngx_int_t rc = websocket_perform_handshake(fsub);
+    if(rc == NGX_OK) {
       fsub->shook_hands = 1;
       return NGX_OK;
     }
@@ -1215,7 +1243,7 @@ static void ping_ev_handler(ngx_event_t *ev) {
 static ngx_int_t websocket_enqueue(subscriber_t *self) {
   full_subscriber_t  *fsub = (full_subscriber_t  *)self;
   ngx_int_t           rc;
-  if((rc = ensure_handshake(fsub)) != NGX_OK) {
+  if((rc = ensure_handshake(fsub)) == NGX_ERROR) {
     return rc;
   }
   self->enqueued = 1;
@@ -1324,6 +1352,360 @@ static void set_buffer(ngx_buf_t *buf, u_char *start, u_char *last, ssize_t len)
   buf->temporary = 0;
   buf->memory = 1;
 }
+
+#if NCHAN_WEBSOCKET_ALLOW_HIXIE
+static uint32_t websocket_extract_part_hixie(ngx_connection_t *c, ngx_str_t *key) {
+  int nspaces = 0;
+  uint64_t val = 0;
+  size_t i;
+  for (i = 0; i < key->len; i ++) {
+    int c = key->data[i];
+    if (c >= 0x30 && c <= 0x39) {
+      val *= 10;
+      val += c - 0x30;
+    }
+    else if (c == 0x20) {
+      nspaces ++;
+    }
+  }
+
+  if (nspaces == 0) {
+    nchan_log(NGX_LOG_INFO, c->log, ngx_socket_errno, "websocket client: no spaces in key (%V)", key);
+    return 0;
+  }
+
+  if (val % nspaces != 0) {
+    nchan_log(NGX_LOG_INFO, c->log, ngx_socket_errno, "websocket client: key number %u is not a multiple of %d spaces", val, nspaces);
+    return 0;
+  }
+
+  return val / nspaces;
+}
+
+static void websocket_set_challenge(u_char *chbuf, uint32_t part1, uint32_t part2, u_char *key3) {
+  int i;
+  for (i = 3; i >= 0; i --) {
+    chbuf[i] = part1 & 0xff;
+    part1 >>= 8;
+  }
+  assert(part1 == 0);
+  for (i = 7; i >= 4; i --) {
+    chbuf[i] = part2 & 0xff;
+    part2 >>= 8;
+  }
+  assert(part2 == 0);
+  memcpy(&chbuf[8], key3, 8);
+}
+
+
+static ngx_buf_t *websocket_compute_location(full_subscriber_t *fsub) {
+  ngx_connection_t          *c;
+  ngx_http_request_t        *r = fsub->sub.request;
+  ngx_http_core_loc_conf_t  *clcf;
+  ngx_http_core_srv_conf_t  *cscf;
+  ngx_str_t                  host;
+  ngx_uint_t                 port;
+  size_t                     len, i, j;
+  ngx_buf_t                 *b;
+  ngx_str_t                  request_uri = ngx_string("/");
+  u_char                     addr[NGX_SOCKADDR_STRLEN];
+  u_char *p;
+
+  c = r->connection;
+
+  if (r->request_line.data == NULL && r->request_start) {
+    for (p = r->request_start; p < r->header_in->last; p++) {
+      if (*p == CR || *p == LF) {
+        break;
+      }
+    }
+
+    r->request_line.len = p - r->request_start;
+    r->request_line.data = r->request_start;
+  }
+
+  for (i = 0; i < r->request_line.len; i ++) {
+    if (r->request_line.data[i] == ' ') {
+      i ++;
+      break;
+    }
+  }
+
+  for (j = i; j < r->request_line.len; j ++) {
+    if (r->request_line.data[j] == ' ') {
+      request_uri.data = &r->request_line.data[i];
+      request_uri.len = j - i;
+      break;
+    }
+  }
+
+  len = 0;
+  clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+
+  if (clcf->server_name_in_redirect) {
+    cscf = ngx_http_get_module_srv_conf(r, ngx_http_core_module);
+    host = cscf->server_name;
+
+  } else if (r->headers_in.server.len) {
+    host = r->headers_in.server;
+
+  } else {
+    host.len = NGX_SOCKADDR_STRLEN;
+    host.data = addr;
+
+    if (ngx_connection_local_sockaddr(c, &host, 0) != NGX_OK) {
+      return NULL;
+    }
+  }
+
+  port = ngx_inet_get_port(c->local_sockaddr);
+
+  len += sizeof("wss://") - 1
+    + host.len
+    + request_uri.len + 2;
+
+  if (clcf->port_in_redirect) {
+
+#if (NGX_HTTP_SSL)
+    if (c->ssl)
+      port = (port == 443) ? 0 : port;
+    else
+#endif
+      port = (port == 80) ? 0 : port;
+
+  } else {
+    port = 0;
+  }
+
+  if (port) {
+    len += sizeof(":65535") - 1;
+  }
+
+  b = ngx_create_temp_buf(r->pool, len);
+  if (b == NULL) {
+    return NULL;
+  }
+
+  *b->last++ = 'w'; *b->last++ = 's';
+#if (NGX_HTTP_SSL)
+  if (c->ssl) {
+    *b->last++ ='s';
+  }
+#endif
+  
+  *b->last++ = ':'; *b->last++ = '/'; *b->last++ = '/';
+  b->last = ngx_copy(b->last, host.data, host.len);
+
+  if (port) {
+    b->last = ngx_sprintf(b->last, ":%ui", port);
+  }
+
+  b->last = ngx_copy(b->last, request_uri.data, request_uri.len);
+  return b;
+}
+
+
+#define WEBSOCKET_HIXIE_RESPONSE_LEN 16
+static ngx_int_t websocket_write_response_hixie(full_subscriber_t *fsub) {
+  ngx_connection_t           *c;
+  ngx_http_request_t         *r = fsub->sub.request;
+
+  u_char challenge[16];
+  ngx_buf_t *b;
+  ngx_chain_t   out;
+
+  ngx_buf_t *lbuf = websocket_compute_location(fsub);
+  ngx_md5_t md5;
+  ngx_str_t loc;
+  ngx_str_t *subproto;
+  uint32_t part1, part2;
+
+  c = r->connection;
+
+  nchan_log(NGX_LOG_ERR, c->log, 0, "hixie key1 (%V) key2 (%V)", fsub->ws_key1, fsub->ws_key2);
+  //nchan_log(NGX_LOG_ERR, c->log, 0, "hixie key3 (%*s)", 8, fsub->ws_key3);
+
+  part1 = websocket_extract_part_hixie(c, fsub->ws_key1);
+  part2 = websocket_extract_part_hixie(c, fsub->ws_key2);
+
+  nchan_log(NGX_LOG_ERR, c->log, 0, "hixie part %l %l (%*s)", part1, part2, 8, fsub->ws_key3);
+
+  if (part1 <= 0 || part2 <= 0) {
+    return NGX_ERROR;
+  }
+
+  b = ngx_create_temp_buf(r->pool,  WEBSOCKET_HIXIE_RESPONSE_LEN);
+  if (b == NULL) {
+    return NGX_ERROR;
+  }
+
+  /* Concatenate part1, part2, and key3. */
+  websocket_set_challenge(challenge, part1, part2, fsub->ws_key3);
+  //nchan_log(NGX_LOG_ERR, c->log, 0, "hixie challenge (%*s)", 16, challenge);
+
+  /* Find the MD5 of the challenge, and put it in the buffer. */
+  ngx_md5_init(&md5);
+  ngx_md5_update(&md5, challenge, sizeof(challenge));
+  ngx_md5_final(b->start, &md5);
+  b->last += WEBSOCKET_HIXIE_RESPONSE_LEN;
+
+  /* Now write out all the headers. */
+  //nchan_log(NGX_LOG_ERR, c->log, 0, "hixie response (%*s)", 16, b->start);
+
+  nchan_include_access_control_if_needed(r, fsub->ctx);
+
+#if nginx_version < 1003013
+  nchan_add_response_header(r, &NCHAN_HEADER_CONNECTION, &NCHAN_UPGRADE);
+#endif
+
+  if (lbuf) {
+    loc.len = lbuf->last - lbuf->start;
+    loc.data = lbuf->start;
+    nchan_log(NGX_LOG_ERR, c->log, 0, "websocket_compute_location (%V)", &loc);
+    nchan_add_response_header(r, &NCHAN_HEADER_SEC_WEBSOCKET_LOCATION, &loc);
+  }
+  nchan_add_response_header(r, &NCHAN_HEADER_SEC_WEBSOCKET_ORIGIN,
+                            nchan_get_header_value(r, NCHAN_HEADER_ORIGIN));
+
+  subproto = nchan_get_header_value(r, NCHAN_HEADERS_SEC_WEBSOCKET_PROTOCOL);
+
+  if (subproto) {
+    nchan_add_response_header(r, &NCHAN_HEADERS_SEC_WEBSOCKET_PROTOCOL,
+                              subproto);
+  }
+  nchan_add_response_header(r, &NCHAN_HEADER_UPGRADE, &NCHAN_WEBSOCKET_HIXIE);
+
+  r->headers_out.status_line = NCHAN_HTTP_STATUS_101_HIXIE;
+  r->headers_out.status = NGX_HTTP_SWITCHING_PROTOCOLS;
+
+  r->keepalive=0; //apparently, websocket must not use keepalive.
+
+  /* Do not send Content-Length. */
+  r->headers_out.content_length_n = -1;
+  //r->header_only = 0; // FIXME: Uncomment to send everything in one packet.
+  
+  ngx_http_send_header(r);
+
+  // FIXME: Free the location here.
+
+  /* Send the response. */
+  b->flush = 1;
+  out.buf = b;
+  out.next = NULL;
+
+  return nchan_output_filter(r, &out);
+}
+
+
+static void websocket_reading_finalize(ngx_http_request_t *r);
+static void websocket_reading_hixie(ngx_http_request_t *r) {
+  nchan_request_ctx_t        *ctx = ngx_http_get_module_ctx(r, ngx_nchan_module);
+  full_subscriber_t          *fsub = (full_subscriber_t *)ctx->sub;
+
+  ngx_int_t  rc;
+
+  ngx_connection_t           *c;
+  ngx_event_t                *rev;
+
+  ngx_buf_t                  *b, buf;
+  ws_frame_t *frame;
+  
+  if(!fsub) {
+    nchan_http_finalize_request(r, NGX_OK);
+    return;
+  }
+  
+  c = r->connection;
+  rev = c->read;
+  frame = &fsub->frame;
+  rc = NGX_OK;
+
+  set_buffer(&buf, frame->header, frame->last, 8);
+
+  //DBG("websocket_reading_hixie fsub: %p, frame: %p", fsub, frame);
+  for (;;) {
+    if (c->error || c->timedout || c->close || c->destroyed || rev->closed || rev->eof || rev->pending_eof) {
+      //ERR("hixie c->error %i c->timedout %i c->close %i c->destroyed %i rev->closed %i rev->eof %i", c->error, c->timedout, c->close, c->destroyed, rev->closed, rev->eof);
+      fsub->sub.request->headers_out.status = NGX_HTTP_CLIENT_CLOSED_REQUEST;
+      return websocket_reading_finalize(r);
+    }
+    
+    switch (frame->step) {
+    case WEBSOCKET_HIXIE_READ_KEY3_STEP:
+      b = &fsub->ws_key3_buf;
+      if (b->last < b->end) {
+        /* Read the rest of key3. */
+        rc = ws_recv(c, rev, b, b->end - b->last);
+        if (rc == NGX_AGAIN) {
+          goto exit;
+        }
+      }
+
+      /* We're committed, so go ahead even if challenge breaks. */
+      frame->step = WEBSOCKET_HIXIE_READ_PAYLOAD_STEP;
+      rc = websocket_write_response_hixie(fsub);
+      if (rc != NGX_OK) {
+        goto exit;
+      }
+      break;
+
+    case WEBSOCKET_HIXIE_READ_PAYLOAD_STEP:
+      nchan_log(NGX_LOG_ERR, c->log, 0, "FIXME: would read hixie payload");
+      
+      rc = NGX_ERROR;
+      goto exit;
+      break;
+
+    default:
+      nchan_log(NGX_LOG_ERR, c->log, 0, "unknown hixie websocket step (%d)", frame->step);
+      return websocket_reading_finalize(r);
+    }
+  }
+  
+exit:
+  
+  if (rc == NGX_AGAIN) {
+    if (!c->read->ready) {
+      if (ngx_handle_read_event(c->read, 0) != NGX_OK) {
+        nchan_log(NGX_LOG_INFO, c->log, ngx_socket_errno, "websocket client: failed to restore read events");
+        return websocket_reading_finalize(r);
+      }
+    }
+  }
+
+  if (rc == NGX_ERROR) {
+    rev->eof = 1;
+    c->error = 1;
+    nchan_log(NGX_LOG_INFO, c->log, ngx_socket_errno, "websocket client prematurely closed connection");
+    return websocket_reading_finalize(r);
+  }
+}
+
+static ngx_int_t websocket_perform_handshake_hixie(full_subscriber_t *fsub) {
+  ngx_http_request_t *r = fsub->sub.request;
+  ngx_buf_t          *buf = &fsub->ws_key3_buf;
+  ws_frame_t         *frame = &fsub->frame;
+
+  if((fsub->ws_key1 = nchan_get_header_value(r, NCHAN_HEADER_SEC_WEBSOCKET_KEY1)) == NULL) {
+    return NGX_ERROR;
+  }
+
+  if((fsub->ws_key2 = nchan_get_header_value(r, NCHAN_HEADER_SEC_WEBSOCKET_KEY2)) == NULL) {
+    return NGX_ERROR;
+  }
+
+  /* Copy the first of key3 from the header_in buffer, if it's there. */
+  while (r->header_in->pos < r->header_in->last && buf->last < buf->end) {
+    *buf->last ++ = *r->header_in->pos ++;
+  }
+
+  r->read_event_handler = websocket_reading_hixie;
+  frame->step = WEBSOCKET_HIXIE_READ_KEY3_STEP;
+  websocket_reading_hixie(r);
+  return NGX_OK;
+}
+#endif /* NCHAN_WEBSOCKET_ALLOW_HIXIE */
+
 
 static void websocket_reading_finalize(ngx_http_request_t *r) {
   nchan_request_ctx_t        *ctx = ngx_http_get_module_ctx(r, ngx_nchan_module);
@@ -1944,7 +2326,7 @@ static ngx_chain_t *websocket_close_frame_chain(full_subscriber_t *fsub, uint16_
 static ngx_int_t websocket_respond_message(subscriber_t *self, nchan_msg_t *msg) {
   ngx_int_t            rc;
   full_subscriber_t   *fsub = (full_subscriber_t *)self;
-  if((rc = ensure_handshake(fsub)) != NGX_OK) {
+  if((rc = ensure_handshake(fsub)) == NGX_ERROR) {
     return rc;
   }
   

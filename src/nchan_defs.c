@@ -23,6 +23,8 @@ const  ngx_str_t NCHAN_HEADER_EVENTSOURCE_EVENT = ngx_string("X-EventSource-Even
 const ngx_str_t NCHAN_HEADER_CONNECTION = ngx_string("Connection");
 const ngx_str_t NCHAN_HEADER_UPGRADE = ngx_string("Upgrade");
 const ngx_str_t NCHAN_HEADER_SEC_WEBSOCKET_KEY = ngx_string("Sec-WebSocket-Key");
+const ngx_str_t NCHAN_HEADER_SEC_WEBSOCKET_KEY1 = ngx_string("Sec-WebSocket-Key1");
+const ngx_str_t NCHAN_HEADER_SEC_WEBSOCKET_KEY2 = ngx_string("Sec-WebSocket-Key2");
 const ngx_str_t NCHAN_HEADER_SEC_WEBSOCKET_ACCEPT = ngx_string("Sec-WebSocket-Accept");
 const ngx_str_t NCHAN_HEADER_SEC_WEBSOCKET_VERSION = ngx_string("Sec-WebSocket-Version");
 const ngx_str_t NCHAN_HEADERS_SEC_WEBSOCKET_PROTOCOL = ngx_string("Sec-WebSocket-Protocol");
@@ -31,6 +33,13 @@ const ngx_str_t NCHAN_HEADER_SEC_WEBSOCKET_EXTENSIONS = ngx_string("Sec-WebSocke
 //and some wobsockety values
 const ngx_str_t NCHAN_UPGRADE = ngx_string("Upgrade");
 const ngx_str_t NCHAN_WEBSOCKET = ngx_string("websocket");
+
+#if NCHAN_WEBSOCKET_ALLOW_HIXIE
+const ngx_str_t NCHAN_HEADER_SEC_WEBSOCKET_LOCATION = ngx_string("Sec-WebSocket-Location");
+const ngx_str_t NCHAN_HEADER_SEC_WEBSOCKET_ORIGIN = ngx_string("Sec-WebSocket-Origin");
+const ngx_str_t NCHAN_HTTP_STATUS_101_HIXIE = ngx_string("101 Web Socket Protocol handshake");
+const ngx_str_t NCHAN_WEBSOCKET_HIXIE = ngx_string("WebSocket");
+#endif
 
 
 //header values
