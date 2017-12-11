@@ -1582,11 +1582,9 @@ static ngx_int_t websocket_write_response_hixie(full_subscriber_t *fsub) {
 
   /* Do not send Content-Length. */
   r->headers_out.content_length_n = -1;
-  //r->header_only = 0; // FIXME: Uncomment to send everything in one packet.
+  r->header_only = 0;
   
   ngx_http_send_header(r);
-
-  // FIXME: Free the location here.
 
   /* Send the response. */
   b->flush = 1;
