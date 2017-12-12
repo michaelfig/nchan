@@ -2244,18 +2244,13 @@ static ngx_chain_t *websocket_frame_header_chain(full_subscriber_t *fsub, const 
       set_buf_to_str(&bc->buf, &frame_start);
       set_buf_to_str(&bc2->buf, &frame_end);
 
-      /* Append our bc2 to the sent buffer. */
+      /* Append our bc2 to the sent chain. */
       cp = &bc->chain;
-      ngx_chain_add_copy(fsub->tmp_pool, &cp, msg_chain);
-      ngx_chain_add_copy(fsub->tmp_pool, &cp, &bc2->chain);
-
-      cp = &bc->chain;
-      while (cp) {
-        //ERR("Have buf (%*s)", cp->buf->last - cp->buf->start, cp->buf->start);
-        cp->buf->last_buf = cp->next ? 0 : 1;
-        cp->buf->last_in_chain = cp->next ? 0 : 1;
+      cp->next = msg_chain;
+      while (cp->next) {
         cp = cp->next;
       }
+      cp->next = &bc2->chain;
     }
     else {
       /* Don't send any data, since the framing cannot accomodate it. */
