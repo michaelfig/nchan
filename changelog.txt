@@ -1,3 +1,5 @@
+hixie (Dec. 11 2017)
+ feature: some backward compatibility for pre-RFC6455 Hixie WebSocket
 1.1.13 (Dec. 4 2017)
  fix: added Redis backwards compatibility with Nchan 1.1.7 and below
       for online upgrades with mixed-version Nchan cluster
