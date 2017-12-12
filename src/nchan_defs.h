@@ -65,18 +65,20 @@ extern const ngx_str_t NCHAN_HEADER_ACCESS_CONTROL_EXPOSE_HEADERS;
 
 extern const ngx_str_t NCHAN_HEADER_EVENTSOURCE_EVENT;
 
-#define NCHAN_WEBSOCKET_ALLOW_HIXIE 1
 extern const ngx_str_t NCHAN_HEADER_CONNECTION;
 extern const ngx_str_t NCHAN_HEADER_UPGRADE;
 extern const ngx_str_t NCHAN_HEADER_SEC_WEBSOCKET_KEY;
-extern const ngx_str_t NCHAN_HEADER_SEC_WEBSOCKET_KEY1;
-extern const ngx_str_t NCHAN_HEADER_SEC_WEBSOCKET_KEY2;
 extern const ngx_str_t NCHAN_HEADER_SEC_WEBSOCKET_ACCEPT;
 extern const ngx_str_t NCHAN_HEADER_SEC_WEBSOCKET_VERSION;
 extern const ngx_str_t NCHAN_HEADERS_SEC_WEBSOCKET_PROTOCOL;
 extern const ngx_str_t NCHAN_HEADER_SEC_WEBSOCKET_EXTENSIONS;
 
+/* Support for pre-RFC6455 WebSocket */
+#define NCHAN_WEBSOCKET_ALLOW_HIXIE 1
 #if NCHAN_WEBSOCKET_ALLOW_HIXIE
+#define WEBSOCKET_HIXIE_MAX_READ_PAYLOAD 8192
+extern const ngx_str_t NCHAN_HEADER_SEC_WEBSOCKET_KEY1;
+extern const ngx_str_t NCHAN_HEADER_SEC_WEBSOCKET_KEY2;
 extern const ngx_str_t NCHAN_HEADER_SEC_WEBSOCKET_ORIGIN;
 extern const ngx_str_t NCHAN_HEADER_SEC_WEBSOCKET_LOCATION;
 extern const ngx_str_t NCHAN_HTTP_STATUS_101_HIXIE;
