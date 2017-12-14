@@ -209,6 +209,8 @@ struct full_subscriber_s {
   ngx_str_t              *ws_key2;
   u_char                  ws_key3[8];
   ngx_buf_t               ws_key3_buf;
+
+  ngx_pool_t             *ws_payload_pool;
 #endif /* NCHAN_WEBSOCKET_ALLOW_HIXIE */
   
   ngx_str_t              *publish_channel_id;
@@ -822,6 +824,7 @@ subscriber_t *websocket_subscriber_create(ngx_http_request_t *r, nchan_msg_id_t 
 #if NCHAN_WEBSOCKET_ALLOW_HIXIE
   set_buffer(&fsub->ws_key3_buf, fsub->ws_key3, NULL, sizeof(fsub->ws_key3));
   fsub->ws_version = 0;
+  fsub->ws_payload_pool = NULL;
 #endif
   ngx_memzero(&fsub->closing_ev, sizeof(fsub->closing_ev));
   nchan_init_timer(&fsub->closing_ev, closing_ev_handler, fsub);
@@ -1600,6 +1603,13 @@ static ngx_int_t websocket_write_response_hixie(full_subscriber_t *fsub) {
 }
 
 
+static void ws_release_payload_pool(full_subscriber_t *fsub)
+{
+  ngx_destroy_pool(fsub->ws_payload_pool);
+  fsub->ws_payload_pool = NULL;
+}
+
+
 static void websocket_reading_finalize(ngx_http_request_t *r);
 static void websocket_reading_hixie(ngx_http_request_t *r) {
   nchan_request_ctx_t        *ctx = ngx_http_get_module_ctx(r, ngx_nchan_module);
@@ -1627,13 +1637,14 @@ static void websocket_reading_hixie(ngx_http_request_t *r) {
 
   if(frame->payload == NULL) {
     frame->payload_len = WEBSOCKET_HIXIE_MAX_READ_PAYLOAD;
-    if(ws_reserve_tmp_pool(fsub) != NGX_OK) {
-      ERR("failed to reserve tmp pool");
+    fsub->ws_payload_pool = ngx_create_pool(frame->payload_len + sizeof(*msgbuf), c->log);
+    if(!fsub->ws_payload_pool) {
+      ERR("failed to reserve payload pool");
       return websocket_reading_finalize(r);
     }
-    if((frame->payload = ngx_palloc(fsub->tmp_pool, frame->payload_len)) == NULL) {
-      ERR("failed to reserve payload len in tmp pool");
-      ws_release_tmp_pool(fsub);
+    if((frame->payload = ngx_palloc(fsub->ws_payload_pool, frame->payload_len)) == NULL) {
+      ERR("failed to reserve payload len in payload pool");
+      ws_release_payload_pool(fsub);
       return websocket_reading_finalize(r);
     }
     frame->last = frame->payload;
@@ -1720,19 +1731,44 @@ static void websocket_reading_hixie(ngx_http_request_t *r) {
       buf.pos = p;
 
       if (buf.pos == buf.end) {
-        ERR("FIXME: Message too big for our britches (len=%d)", frame->payload_len);
-        ws_release_tmp_pool(fsub);
-        return websocket_reading_finalize(r);
+        /* Expand our payload pool, and go for another read. */
+        ngx_pool_t *new_pl;
+
+        //TODO: check max websocket message length
+        frame->payload_len *= 2;
+        new_pl = ngx_create_pool(frame->payload_len + sizeof(*msgbuf), c->log);
+        if(!new_pl) {
+          ERR("failed to reserve fresh payload pool");
+          ws_release_payload_pool(fsub);
+          return websocket_reading_finalize(r);
+        }
+
+        if((frame->payload = ngx_palloc(new_pl, frame->payload_len)) == NULL) {
+          ERR("failed to reserve payload len in fresh payload pool");
+          ngx_destroy_pool(new_pl);
+          ws_release_payload_pool(fsub);
+          return websocket_reading_finalize(r);
+        }
+
+        frame->last = frame->payload + (buf.last - buf.start);
+        ngx_memcpy(frame->payload, buf.start, buf.end - buf.start);
+        set_buffer(&buf, frame->payload, frame->last, frame->payload_len);
+
+        ws_release_payload_pool(fsub);
+        fsub->ws_payload_pool = new_pl;
+
+        /* Read some more. */
+        continue;
       }
 
       if (buf.pos == buf.last && rc == NGX_AGAIN) {
-        // Read some more.
+        /* Read some more after renewing the read request. */
         goto exit;
       }
 
-      if((msgbuf = ngx_palloc(fsub->tmp_pool, sizeof(*msgbuf))) == NULL) {
-        ERR("failed to reserve payload msgbuf in tmp pool");
-        ws_release_tmp_pool(fsub);
+      if((msgbuf = ngx_palloc(fsub->ws_payload_pool, sizeof(*msgbuf))) == NULL) {
+        ERR("failed to reserve payload msgbuf in payload pool");
+        ws_release_payload_pool(fsub);
         return websocket_reading_finalize(r);
       }
 
@@ -1746,7 +1782,7 @@ static void websocket_reading_hixie(ngx_http_request_t *r) {
       //ERR("Processing message buffer (%*s)", msgbuf->last - msgbuf->start, msgbuf->start);
 
       if (!is_utf8(msgbuf)) {
-        ws_release_tmp_pool(fsub);
+        ws_release_payload_pool(fsub);
         ERR("invalid text frame (not UTF8).");
         return websocket_reading_finalize(r);
       }
@@ -1759,19 +1795,20 @@ static void websocket_reading_hixie(ngx_http_request_t *r) {
       buf.pos ++;
 
       if (buf.last - buf.pos > 0) {
-        /* Move remaining bytes back to the beginning of the payload buffer. */
+        /* Move remaining bytes to the beginning of the payload buffer. */
+        frame->payload_len = WEBSOCKET_HIXIE_MAX_READ_PAYLOAD;
         ngx_memmove(frame->payload, buf.pos, buf.last - buf.pos);
         frame->last = frame->payload + (buf.last - buf.pos);
-        frame->payload_len = WEBSOCKET_HIXIE_MAX_READ_PAYLOAD;
 
         //ERR("Fast forwarding to (%*s)", frame->last - frame->payload, frame->payload);
       }
       else {
-        /* Free memory, since we're at the end of the buffer. */
-        //ERR("Freeing payload memory");
+        /* Free memory, since we have nothing buffered. */
+        //ERR("Freeing payload buffer");
         frame->payload = NULL;
         frame->last = NULL;
         frame->payload_len = 0;
+        ws_release_payload_pool(fsub);
       }
       frame->step = WEBSOCKET_HIXIE_READ_TYPE_STEP;
       break;
